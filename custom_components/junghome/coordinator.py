@@ -96,6 +96,19 @@ class JunghomeCoordinator(DataUpdateCoordinator):
         """Shutdown the coordinator and disconnect WebSocket."""
         await self._gateway.disconnect_websocket()
 
+    async def async_manual_refresh(self) -> None:
+        """Manually refresh all device data and update entities."""
+        _LOGGER.info("Manual refresh requested")
+        try:
+            await self._refresh_device_data()
+            # Trigger update to all entities
+            self.async_set_updated_data(await self._async_update_data())
+            _LOGGER.info("Manual refresh completed successfully")
+        except Exception as err:
+            _LOGGER.error("Manual refresh failed: %s", err)
+            raise
+
+
     async def _handle_websocket_data(self, data_type: str, data: dict) -> None:
         """Handle incoming WebSocket data."""
         if data_type == "functions":
@@ -271,12 +284,10 @@ class JunghomeCoordinator(DataUpdateCoordinator):
                 device["available"] = True
                 try:
                     switch_value = bool(int(float(value)))
-                    # For brightness-capable lights, ignore switch "0" and only respond to switch "1"
+                    # For brightness-capable lights, completely ignore switch datapoints
                     if device_type in ["DimmerLight", "ColorLight"]:
-                        # Only turn on when switch is "1", ignore switch "0"
-                        if switch_value:
-                            device["is_on"] = True
-                        # Don't change state on switch "0" - wait for brightness "0"
+                        # Ignore all switch updates for dimmer lights - only brightness determines state
+                        pass
                     else:
                         # For OnOff and Socket, use switch state normally
                         device["is_on"] = switch_value
@@ -348,13 +359,23 @@ class JunghomeCoordinator(DataUpdateCoordinator):
                     device["available"] = False
                 elif value is not None:
                     try:
-                        device["is_on"] = bool(int(float(value)))
+                        switch_value = bool(int(float(value)))
+                        # For brightness-capable lights, ignore switch and let brightness determine state
+                        if device_type in ["DimmerLight", "ColorLight"]:
+                            # Don't set is_on here - will be set by brightness processing
+                            pass
+                        else:
+                            # For OnOff and Socket, use switch state
+                            device["is_on"] = switch_value
                     except (ValueError, TypeError):
-                        device["is_on"] = False
+                        if device_type not in ["DimmerLight", "ColorLight"]:
+                            device["is_on"] = False
                 else:
-                    device["is_on"] = False
+                    if device_type not in ["DimmerLight", "ColorLight"]:
+                        device["is_on"] = False
             else:
-                device["is_on"] = False
+                if device_type not in ["DimmerLight", "ColorLight"]:
+                    device["is_on"] = False
                 
             if device_type in ["DimmerLight", "ColorLight"]:
                 brightness_datapoint = self._find_datapoint(device, "brightness")
@@ -366,12 +387,17 @@ class JunghomeCoordinator(DataUpdateCoordinator):
                         try:
                             brightness_value = int(float(value))
                             device["brightness"] = int((brightness_value / 100) * 255)
+                            # For brightness-capable lights, determine on/off state from brightness
+                            device["is_on"] = brightness_value > 0
                         except (ValueError, TypeError):
-                            device["brightness"] = 255 if device.get("is_on") else 0
+                            device["brightness"] = 0
+                            device["is_on"] = False
                     else:
-                        device["brightness"] = 255 if device.get("is_on") else 0
+                        device["brightness"] = 0
+                        device["is_on"] = False
                 else:
-                    device["brightness"] = 255 if device.get("is_on") else 0
+                    device["brightness"] = 0
+                    device["is_on"] = False
                     
         return device
 
