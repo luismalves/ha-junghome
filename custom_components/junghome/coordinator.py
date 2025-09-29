@@ -270,7 +270,16 @@ class JunghomeCoordinator(DataUpdateCoordinator):
             elif value is not None:
                 device["available"] = True
                 try:
-                    device["is_on"] = bool(int(float(value)))
+                    switch_value = bool(int(float(value)))
+                    # For brightness-capable lights, ignore switch "0" and only respond to switch "1"
+                    if device_type in ["DimmerLight", "ColorLight"]:
+                        # Only turn on when switch is "1", ignore switch "0"
+                        if switch_value:
+                            device["is_on"] = True
+                        # Don't change state on switch "0" - wait for brightness "0"
+                    else:
+                        # For OnOff and Socket, use switch state normally
+                        device["is_on"] = switch_value
                 except (ValueError, TypeError):
                     # Skip invalid values
                     pass
@@ -284,6 +293,8 @@ class JunghomeCoordinator(DataUpdateCoordinator):
                 try:
                     brightness_value = int(float(value))
                     device["brightness"] = int((brightness_value / 100) * 255)  # Convert to HA scale
+                    # For brightness-capable lights, determine on/off state from brightness
+                    device["is_on"] = brightness_value > 0
                 except (ValueError, TypeError):
                     # Skip invalid values
                     pass
