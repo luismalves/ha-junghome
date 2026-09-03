@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from .const import (
@@ -31,6 +32,7 @@ class JunghomeCoordinator(DataUpdateCoordinator):
         self.ip = entry.data[CONF_IP_ADDRESS]
         self.token = entry.data[CONF_TOKEN]
         self._gateway = JunghomeGateway(self.ip, self.token)
+        self.hub_config = JunghomeHubConfigCoordinator(hass, self.ip, self.token)
         self._functions = {}
         self._groups = {}
         self._scenes = {}
@@ -76,6 +78,10 @@ class JunghomeCoordinator(DataUpdateCoordinator):
         
         # Start WebSocket connection
         await self._gateway.connect_websocket(self._handle_websocket_data)
+
+        # Hub config is shared by the sensor and binary_sensor platforms, so it
+        # is fetched here once rather than once per platform.
+        await self.hub_config.async_config_entry_first_refresh()
         
         # Wait a moment for initial WebSocket data
         await asyncio.sleep(2)
@@ -119,6 +125,7 @@ class JunghomeCoordinator(DataUpdateCoordinator):
 
     async def async_shutdown(self) -> None:
         """Shutdown the coordinator and disconnect WebSocket."""
+        await self.hub_config.async_shutdown()
         await self._gateway.disconnect_websocket()
 
     async def _handle_websocket_data(self, data_type: str, data: dict) -> None:
@@ -615,3 +622,43 @@ class JunghomeCoordinator(DataUpdateCoordinator):
     def is_websocket_connected(self) -> bool:
         """Return True if WebSocket is connected."""
         return self._gateway.is_connected
+
+
+class JunghomeHubConfigCoordinator(DataUpdateCoordinator):
+    """Jung Home hub configuration update coordinator.
+
+    One per config entry, owned by JunghomeCoordinator. It used to be built by
+    each platform that wanted it, which meant the same endpoint was polled once
+    per platform - two identical GETs milliseconds apart at startup and every
+    five minutes after.
+    """
+
+    def __init__(self, hass: HomeAssistant, ip: str, token: str) -> None:
+        """Initialize the coordinator."""
+        self.ip = ip
+        self.token = token
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="Jung Home Hub Config",
+            update_interval=timedelta(minutes=5),  # Update every 5 minutes
+        )
+
+    async def _async_update_data(self) -> dict:
+        """Fetch hub configuration from Jung Home API."""
+        try:
+            config = await asyncio.wait_for(
+                JunghomeGateway.request_hub_config(self.ip, self.token),
+                timeout=30.0
+            )
+
+            if config is None:
+                raise Exception("Failed to get hub configuration from Jung Home API")
+
+            return config
+
+        except asyncio.TimeoutError as err:
+            raise Exception(f"Timeout connecting to Jung Home hub at {self.ip}") from err
+        except Exception as err:
+            raise Exception(f"Error communicating with Jung Home API: {err}") from err

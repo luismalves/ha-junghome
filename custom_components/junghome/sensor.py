@@ -1,56 +1,20 @@
 """Platform for sensor integration."""
 from __future__ import annotations
-import asyncio
 import logging
-from datetime import timedelta
 
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
 from . import JunghomeConfigEntry
+from .coordinator import JunghomeHubConfigCoordinator
 from .datapoints import extract_quantity_label_unit, iter_datapoints_by_type
 from .entity import JunghomeDeviceEntity
-from .junghome_client import JunghomeGateway
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class JunghomeHubConfigCoordinator(DataUpdateCoordinator):
-    """Jung Home hub configuration update coordinator."""
-
-    def __init__(self, hass: HomeAssistant, ip: str, token: str) -> None:
-        """Initialize the coordinator."""
-        self.ip = ip
-        self.token = token
-
-        super().__init__(
-            hass,
-            _LOGGER,
-            name="Jung Home Hub Config",
-            update_interval=timedelta(minutes=5),  # Update every 5 minutes
-        )
-
-    async def _async_update_data(self) -> dict:
-        """Fetch hub configuration from Jung Home API."""
-        try:
-            config = await asyncio.wait_for(
-                JunghomeGateway.request_hub_config(self.ip, self.token),
-                timeout=30.0
-            )
-            
-            if config is None:
-                raise Exception("Failed to get hub configuration from Jung Home API")
-            
-            return config
-            
-        except asyncio.TimeoutError as err:
-            raise Exception(f"Timeout connecting to Jung Home hub at {self.ip}") from err
-        except Exception as err:
-            raise Exception(f"Error communicating with Jung Home API: {err}") from err
 
 
 async def async_setup_entry(
@@ -63,11 +27,8 @@ async def async_setup_entry(
     _LOGGER.info("Initialize Jung Home sensors from coordinator")
     created_sensor_ids: set[str] = set()
 
-    # Create hub config coordinator once for this platform setup
-    hub_coordinator = JunghomeHubConfigCoordinator(
-        hass, coordinator.ip, coordinator.token
-    )
-    await hub_coordinator.async_config_entry_first_refresh()
+    # Shared with binary_sensor; already refreshed during coordinator setup.
+    hub_coordinator = coordinator.hub_config
     async_add_entities(
         [
             JunghomeCloudStateSensor(hub_coordinator),

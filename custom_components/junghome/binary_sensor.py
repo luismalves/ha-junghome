@@ -10,7 +10,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
 from . import JunghomeConfigEntry
-from .sensor import JunghomeHubConfigCoordinator
+from .coordinator import JunghomeHubConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,17 +22,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up Jung Home hub binary sensors from a config entry."""
     
-    # Get main coordinator to extract IP and token
-    main_coordinator = config_entry.runtime_data
-    
-    # Create hub config coordinator (reuse from sensor.py)
-    hub_coordinator = JunghomeHubConfigCoordinator(
-        hass, main_coordinator.ip, main_coordinator.token
-    )
-    
-    # Initial data fetch
-    await hub_coordinator.async_config_entry_first_refresh()
-    
+    # Shared with sensor; already refreshed during coordinator setup.
+    hub_coordinator = config_entry.runtime_data.hub_config
+
     # Create binary sensor entities
     binary_sensors = [
         JunghomeCloudErrorBinarySensor(hub_coordinator),
