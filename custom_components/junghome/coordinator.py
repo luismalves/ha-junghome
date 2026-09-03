@@ -80,8 +80,12 @@ class JunghomeCoordinator(DataUpdateCoordinator):
         await self._gateway.connect_websocket(self._handle_websocket_data)
 
         # Hub config is shared by the sensor and binary_sensor platforms, so it
-        # is fetched here once rather than once per platform.
-        await self.hub_config.async_config_entry_first_refresh()
+        # is fetched here once rather than once per platform. Deliberately not
+        # async_config_entry_first_refresh: these entities are diagnostics about
+        # the gateway, and an endpoint this flaky must not be able to take the
+        # lights down with it. On failure they come up unavailable and the five
+        # minute poll heals them - every accessor already reads `data or {}`.
+        await self.hub_config.async_refresh()
         
         # Wait a moment for initial WebSocket data
         await asyncio.sleep(2)
