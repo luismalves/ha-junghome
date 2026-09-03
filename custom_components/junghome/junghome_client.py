@@ -4,8 +4,36 @@ import json
 import logging
 from typing import Callable
 
+INITIAL_RECONNECT_DELAY = 5
+MAX_RECONNECT_DELAY = 60
+
 # Set up logging for this module
 _LOGGER = logging.getLogger(__name__)
+
+_SESSION: aiohttp.ClientSession | None = None
+
+
+def _session() -> aiohttp.ClientSession:
+    """Return the shared session used for every gateway API call.
+
+    The gateway is a small embedded box. Opening a fresh TCP+TLS connection per
+    request - which is what a ClientSession per call means - is enough to knock
+    its backend over under sustained write load, after which it answers 502 or
+    405, or refuses :443 outright, until it restarts.
+
+    keepalive_timeout stays below the usual embedded proxy idle timeout so
+    pooled connections are dropped by us rather than found dead by us.
+
+    Lives for the life of the process and is shared by every config entry;
+    recreated on demand if anything closes it.
+    """
+    global _SESSION
+    if _SESSION is None or _SESSION.closed:
+        _SESSION = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit_per_host=2, keepalive_timeout=15),
+            timeout=aiohttp.ClientTimeout(total=15, connect=5),
+        )
+    return _SESSION
 
 class JunghomeGateway:
     def __init__(self, host: str, token: str):
@@ -19,6 +47,7 @@ class JunghomeGateway:
         self._data_callback = None
         self._is_connected = False
         self._should_reconnect = True
+        self._reconnect_delay = INITIAL_RECONNECT_DELAY
         self._functions = {}
         self._groups = {}
         self._scenes = {}
@@ -170,11 +199,10 @@ class JunghomeGateway:
 
         # Send request
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, ssl=False) as response:
-                    response.raise_for_status()
-                    _LOGGER.info(f"GET request to {url} succeeded.")
-                    return await response.json()
+            async with _session().get(url, headers=headers, ssl=False) as response:
+                response.raise_for_status()
+                _LOGGER.info(f"GET request to {url} succeeded.")
+                return await response.json()
         except aiohttp.ClientResponseError as e:
             if e.status == 401:
                 _LOGGER.error(f"Authentication failed for {url}: {e}")
@@ -208,36 +236,43 @@ class JunghomeGateway:
         
         _LOGGER.debug(f"Sending PATCH request to {url} with headers {headers} and data {data}...")
 
-        # Send request
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.patch(url, headers=headers, json=data, ssl=False) as response:
+        # Send request. Attempt 2 exists only for a pooled connection the gateway
+        # closed while it sat idle; that surfaces as ServerDisconnectedError before
+        # the request is sent, so replaying it is safe. Anything else fails once.
+        for attempt in (1, 2):
+            try:
+                async with _session().patch(url, headers=headers, json=data, ssl=False) as response:
                     response.raise_for_status()
                     _LOGGER.info(f"PATCH request to {url} succeeded.")
-                    
+
                     # Get response text first, then parse as JSON
                     response_text = await response.text()
                     if response_text:
                         try:
-                            import json
                             return json.loads(response_text)
                         except json.JSONDecodeError as json_err:
                             _LOGGER.warning(f"Failed to parse JSON response from {url}: {json_err}. Response: {response_text}")
-                    
+
                     # If no response body or JSON parsing failed, but request was successful
                     return {"success": True}
-                    
-        except aiohttp.ClientResponseError as e:
-            if e.status == 401:
-                _LOGGER.error(f"Authentication failed for {url}: {e}")
-            elif e.status == 404:
-                _LOGGER.error(f"Device/datapoint not found for {url}: {e}")
-            else:
-                _LOGGER.error(f"HTTP error {e.status} for {url}: {e}")
-            return None
-        except aiohttp.ClientError as e:
-            _LOGGER.error(f"Failed to update data on {url}: {e}")
-            return None
+
+            except aiohttp.ServerDisconnectedError as e:
+                if attempt == 1:
+                    _LOGGER.debug(f"Stale pooled connection to {url}, retrying once.")
+                    continue
+                _LOGGER.error(f"Failed to update data on {url}: {e}")
+                return None
+            except aiohttp.ClientResponseError as e:
+                if e.status == 401:
+                    _LOGGER.error(f"Authentication failed for {url}: {e}")
+                elif e.status == 404:
+                    _LOGGER.error(f"Device/datapoint not found for {url}: {e}")
+                else:
+                    _LOGGER.error(f"HTTP error {e.status} for {url}: {e}")
+                return None
+            except aiohttp.ClientError as e:
+                _LOGGER.error(f"Failed to update data on {url}: {e}")
+                return None
 
     # ==================================================================================
     # WEBSOCKET FUNCTIONS
@@ -276,11 +311,19 @@ class JunghomeGateway:
                 await self._connect_and_listen()
             except Exception as err:
                 _LOGGER.error("WebSocket connection failed: %s", err)
-                self._is_connected = False
-                
-                if self._should_reconnect:
-                    _LOGGER.info("Retrying WebSocket connection in 5 seconds...")
-                    await asyncio.sleep(5)
+
+            self._is_connected = False
+
+            # Also reached when the socket closes cleanly, which previously
+            # reconnected with no delay at all. Back off either way: a gateway
+            # that just dropped us is the last thing that wants a retry storm.
+            if self._should_reconnect:
+                _LOGGER.info(
+                    "Retrying WebSocket connection in %d seconds...",
+                    self._reconnect_delay,
+                )
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
 
     async def _connect_and_listen(self):
         """Connect to WebSocket and listen for messages."""
@@ -300,38 +343,42 @@ class JunghomeGateway:
         
         _LOGGER.info("Connecting to WebSocket at %s", ws_url)
         
+        # The WebSocket keeps its own session: it holds one long-lived connection
+        # and must not sit in the request pool. The finally is the point - when
+        # ws_connect raised (a 502 from the gateway, say) this session used to be
+        # dropped on the floor unclosed, once every retry, forever.
         self._ws_session = aiohttp.ClientSession()
-        self._ws_connection = await self._ws_session.ws_connect(
-            ws_url, 
-            headers=headers, 
-            ssl=False,
-            heartbeat=30
-        )
-        
-        self._is_connected = True
-        _LOGGER.info("WebSocket connected successfully")
-        
-        
-        async for msg in self._ws_connection:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    await self._handle_websocket_message(data)
-                except json.JSONDecodeError as err:
-                    _LOGGER.warning("Failed to decode WebSocket message: %s, raw data: %s", err, msg.data)
-                    
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                _LOGGER.error("WebSocket error: %s", self._ws_connection.exception())
-                break
-                
-            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                _LOGGER.info("WebSocket connection closed")
-                break
-                
-        self._is_connected = False
-        
-        if self._ws_session:
+        try:
+            self._ws_connection = await self._ws_session.ws_connect(
+                ws_url,
+                headers=headers,
+                ssl=False,
+                heartbeat=30
+            )
+
+            self._is_connected = True
+            self._reconnect_delay = INITIAL_RECONNECT_DELAY
+            _LOGGER.info("WebSocket connected successfully")
+
+            async for msg in self._ws_connection:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        await self._handle_websocket_message(data)
+                    except json.JSONDecodeError as err:
+                        _LOGGER.warning("Failed to decode WebSocket message: %s, raw data: %s", err, msg.data)
+
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.error("WebSocket error: %s", self._ws_connection.exception())
+                    break
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    _LOGGER.info("WebSocket connection closed")
+                    break
+        finally:
+            self._is_connected = False
             await self._ws_session.close()
+            self._ws_session = None
 
     async def _handle_websocket_message(self, data: dict):
         """Handle incoming WebSocket messages."""
